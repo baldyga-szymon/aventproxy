@@ -322,6 +322,9 @@ func (rf *RTPForwarder) cacheNAL(packet *rtp.Packet, nalType byte) {
 	}
 }
 
+// ForwardVideoPacket restamps an H.264 RTP packet from the camera (one
+// timestamp per frame, sequence numbers shifted past injected packets),
+// injects the cached SPS/PPS ahead of each IDR, and sends it to every client.
 func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 	// Write lock: this mutates forwarder state, and forwardVideoData may
 	// remove dead clients from the map.
@@ -416,6 +419,8 @@ func (rf *RTPForwarder) forwardVideoData(packet *rtp.Packet) {
 	}
 }
 
+// ForwardAudioPacket restamps a PCMU RTP packet from the wall clock and sends
+// it to every client.
 func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
 	rf.mutex.Lock()
 	defer rf.mutex.Unlock()
@@ -429,8 +434,7 @@ func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
 		rf.audioTimeStart = time.Now()
 		rf.audioTsStarted = true
 	}
-	elapsed := time.Since(rf.audioTimeStart)
-	packet.Timestamp = uint32(elapsed.Seconds() * 8000)
+	packet.Timestamp = rtpTicks(time.Since(rf.audioTimeStart), 8000)
 
 	// Serialize packet
 	data, err := packet.Marshal()
@@ -600,6 +604,8 @@ type frameClock struct {
 
 const maxFrameSpan = 100 * time.Millisecond
 
+// timestamp returns the RTP timestamp for the next video packet. marker is
+// the packet's RTP marker bit, which ends the current frame.
 func (c *frameClock) timestamp(marker bool, clockRate int) uint32 {
 	now := time.Now()
 	if !c.started {
@@ -607,7 +613,7 @@ func (c *frameClock) timestamp(marker bool, clockRate int) uint32 {
 		c.wallStart = now
 		c.frameWall = now
 	} else if !c.open || now.Sub(c.frameWall) > maxFrameSpan {
-		ts := uint32(now.Sub(c.wallStart).Seconds() * float64(clockRate))
+		ts := rtpTicks(now.Sub(c.wallStart), clockRate)
 		// Keep frames strictly increasing; the int32 difference survives wraparound.
 		if int32(ts-c.frameTs) <= 0 {
 			ts = c.frameTs + 1
@@ -617,4 +623,14 @@ func (c *frameClock) timestamp(marker bool, clockRate int) uint32 {
 	}
 	c.open = !marker
 	return c.frameTs
+}
+
+// rtpTicks converts elapsed time to RTP clock ticks, wrapping at 2^32 the way
+// RTP timestamps do. It uses integer arithmetic because the Go spec leaves a
+// float-to-uint32 conversion past the uint32 range implementation-dependent,
+// and at 90 kHz the clock passes that range after about 13 hours.
+func rtpTicks(elapsed time.Duration, clockRate int) uint32 {
+	secs := uint64(elapsed / time.Second)
+	frac := uint64(elapsed % time.Second)
+	return uint32(secs*uint64(clockRate) + frac*uint64(clockRate)/uint64(time.Second))
 }

@@ -43,6 +43,26 @@ func TestFrameClockStaysIncreasingAcrossWraparound(t *testing.T) {
 	}
 }
 
+func TestRtpTicksWrapsPast32Bits(t *testing.T) {
+	// 14 h at 90 kHz is 4_536_000_000 ticks, past 2^32.
+	if got, want := rtpTicks(14*time.Hour, 90000), uint32(4_536_000_000-(1<<32)); got != want {
+		t.Fatalf("got %d, want %d", got, want)
+	}
+	if got := rtpTicks(1500*time.Millisecond, 8000); got != 12000 {
+		t.Fatalf("got %d, want 12000", got)
+	}
+}
+
+func TestFrameClockKeepsAdvancingAfter32Bits(t *testing.T) {
+	start := time.Now().Add(-14 * time.Hour)
+	c := frameClock{started: true, wallStart: start, frameTs: rtpTicks(14*time.Hour-50*time.Millisecond, 90000)}
+
+	got := c.timestamp(true, 90000)
+	if gap := int32(got - rtpTicks(14*time.Hour-50*time.Millisecond, 90000)); gap < 90000*40/1000 || gap > 90000*500/1000 {
+		t.Fatalf("frame after 14 h advanced %d ticks, want about 50 ms (4500)", gap)
+	}
+}
+
 // readInterleaved collects the RTP packets a TCP client receives.
 func readInterleaved(t *testing.T, conn net.Conn, n int) []*rtp.Packet {
 	t.Helper()
