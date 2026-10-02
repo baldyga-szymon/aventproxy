@@ -36,13 +36,16 @@ type RTPForwarder struct {
 	spsPacket *rtp.Packet
 	ppsPacket *rtp.Packet
 
-	// Timestamp rebasing
-	videoTimeStart time.Time
-	videoSeqStart  uint16
-	videoTsStarted bool
+	// Timestamp rebasing. The camera sends one constant RTP timestamp, so
+	// timestamps come from the wall clock: per frame for video (every packet
+	// of a frame must share one), per packet for audio.
+	videoTs        frameClock
 	audioTimeStart time.Time
-	audioSeqStart  uint16
 	audioTsStarted bool
+
+	// Packets injected into the video stream (cached SPS/PPS) shift the
+	// sequence numbers of everything after them.
+	videoSeqOffset uint16
 
 	OnBackchannelAudio func(*rtp.Packet)
 }
@@ -320,22 +323,17 @@ func (rf *RTPForwarder) cacheNAL(packet *rtp.Packet, nalType byte) {
 }
 
 func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
-	rf.mutex.RLock()
+	// Write lock: this mutates forwarder state, and forwardVideoData may
+	// remove dead clients from the map.
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
 	if len(rf.clients) == 0 {
-		rf.mutex.RUnlock()
 		return
 	}
 
-	// Rebase timestamp to wall clock (90kHz for H264)
-	if !rf.videoTsStarted {
-		rf.videoTimeStart = time.Now()
-		rf.videoSeqStart = packet.SequenceNumber
-		rf.videoTsStarted = true
-	}
-	elapsed := time.Since(rf.videoTimeStart)
-	packet.Timestamp = uint32(elapsed.Seconds() * 90000)
-	packet.SequenceNumber = rf.videoSeqStart + (packet.SequenceNumber - rf.videoSeqStart)
+	packet.Timestamp = rf.videoTs.timestamp(packet.Marker, 90000)
+	packet.SequenceNumber += rf.videoSeqOffset
 
 	nalType := rf.getNALType(packet)
 
@@ -349,14 +347,22 @@ func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 		rf.cacheSTAP(packet)
 	}
 
-	// Before IDR keyframe (5), inject cached SPS/PPS
+	// Before IDR keyframe (5), inject cached SPS/PPS. They belong to the
+	// IDR's access unit, so they take its timestamp and get their own
+	// sequence numbers instead of replaying the stale cached ones.
 	if nalType == 5 && rf.spsPacket != nil && rf.ppsPacket != nil {
-		rf.forwardVideoData(rf.spsPacket)
-		rf.forwardVideoData(rf.ppsPacket)
+		for _, cached := range []*rtp.Packet{rf.spsPacket, rf.ppsPacket} {
+			injected := cached.Clone()
+			injected.Timestamp = packet.Timestamp
+			injected.SequenceNumber = packet.SequenceNumber
+			injected.Marker = false
+			rf.forwardVideoData(injected)
+			packet.SequenceNumber++
+			rf.videoSeqOffset++
+		}
 	}
 
 	rf.forwardVideoData(packet)
-	rf.mutex.RUnlock()
 }
 
 func (rf *RTPForwarder) forwardVideoData(packet *rtp.Packet) {
@@ -411,8 +417,8 @@ func (rf *RTPForwarder) forwardVideoData(packet *rtp.Packet) {
 }
 
 func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
-	rf.mutex.RLock()
-	defer rf.mutex.RUnlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
 	if len(rf.clients) == 0 {
 		return
@@ -578,4 +584,37 @@ func (rf *RTPForwarder) sendInterleavedRTP(conn net.Conn, channel byte, rtpData 
 	}
 
 	return nil
+}
+
+// frameClock stamps video packets with the wall clock, once per frame. A frame
+// runs from its first packet to the one carrying the RTP marker bit; if that
+// packet is lost, a frame is closed anyway after maxFrameSpan so the next one
+// does not inherit its timestamp.
+type frameClock struct {
+	started   bool
+	wallStart time.Time
+	open      bool
+	frameWall time.Time
+	frameTs   uint32
+}
+
+const maxFrameSpan = 100 * time.Millisecond
+
+func (c *frameClock) timestamp(marker bool, clockRate int) uint32 {
+	now := time.Now()
+	if !c.started {
+		c.started = true
+		c.wallStart = now
+		c.frameWall = now
+	} else if !c.open || now.Sub(c.frameWall) > maxFrameSpan {
+		ts := uint32(now.Sub(c.wallStart).Seconds() * float64(clockRate))
+		// Keep frames strictly increasing; the int32 difference survives wraparound.
+		if int32(ts-c.frameTs) <= 0 {
+			ts = c.frameTs + 1
+		}
+		c.frameTs = ts
+		c.frameWall = now
+	}
+	c.open = !marker
+	return c.frameTs
 }
